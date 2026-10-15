@@ -1,4 +1,5 @@
 import mqtt from "mqtt";
+import { unitMetricJson } from "../prometheus.js";
 
 const LOG_QUIET_MS = 30_000;
 const DEFAULT_PREFIX = "sparkdash";
@@ -9,6 +10,7 @@ const DEFAULT_PREFIX = "sparkdash";
  *
  *   {prefix}/events            one JSON EventLog record per accepted event
  *   {prefix}/status/{sparkId}  retained "1"/"0", mirroring sparkdash_up
+ *   {prefix}/metrics/{sparkId} JSON twin of the unit's Prometheus series
  *   {prefix}/status/dashboard  retained "1" while connected, LWT "0" otherwise
  *
  * Publishing never throws and never blocks a poll loop: while the broker is
@@ -83,19 +85,27 @@ export class MqttPublisher {
   }
 
   /**
-   * Availability for every Spark in fleet order, from the same snapshots the
-   * Prometheus export renders. Retained so subscribers learn the last state
-   * immediately on (re)subscribe; an offline unit gets "0" and no other payload.
-   * @param {Array<{ id?: string, online?: boolean } | null | undefined>} snapshots
+   * Publish the fleet: retained availability plus a metrics payload per unit,
+   * from the same entries the /metrics route renders (`metricsEntries()` output
+   * — bare snapshots also work, they just lack collection provenance). The
+   * metrics payload is the unit's `unitMetricJson()` with a `ts` added; an
+   * offline unit gets `{up: 0}` so the metrics topic shows the unit went down,
+   * matching the "sparkdash_up 0 and nothing else" rule.
+   * @param {Array<object | { snapshot: object, collected?: object, collectedAt?: object } | null | undefined>} entries
    */
-  publishSnapshots(snapshots) {
+  publishFleet(entries) {
     const s = this._getSettings();
-    if (!s.mqttEnabled || !Array.isArray(snapshots)) return;
+    if (!s.mqttEnabled || !Array.isArray(entries)) return;
     const base = this._prefix();
-    for (const snap of snapshots) {
+    for (const entry of entries) {
+      const snap = entry && typeof entry === "object" && entry.snapshot ? entry.snapshot : entry;
       if (!snap?.id) continue;
+      const id = encodeURIComponent(snap.id);
       const up = snap.online === true;
-      this._publish(`${base}/status/${encodeURIComponent(snap.id)}`, up ? "1" : "0", { retain: true });
+      this._publish(`${base}/status/${id}`, up ? "1" : "0", { retain: true });
+      const json = unitMetricJson(entry);
+      const payload = { ts: Date.now(), ...json };
+      this._publish(`${base}/metrics/${id}`, JSON.stringify(payload), { qos: 0 });
     }
   }
 

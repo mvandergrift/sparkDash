@@ -2308,6 +2308,11 @@ function broadcastPayload(payload) {
   });
 }
 
+/** Fleet entries with per-domain provenance, exactly what /metrics renders. */
+function mqttFleetEntries() {
+  return metricsEntries(registry.sparkIds.map((id) => monitors.get(id)));
+}
+
 /**
  * Force an immediate broadcast, ignoring the diff cache.
  * Used after a user action (manual refresh / hermes check / update) so the
@@ -2317,7 +2322,7 @@ function forceBroadcast() {
   const payload = buildSnapshotPayload();
   _lastBroadcastPayload = payload;
   broadcastPayload(payload);
-  mqttPublisher.publishSnapshots(orderedSnapshots());
+  mqttPublisher.publishFleet(mqttFleetEntries());
 }
 
 function startBroadcast() {
@@ -2329,8 +2334,8 @@ function startBroadcast() {
     if (_lastBroadcastPayload !== null && payload === _lastBroadcastPayload) return;
     _lastBroadcastPayload = payload;
     broadcastPayload(payload);
-    // Availability topics ride the same diff gate: only when the fleet changed.
-    mqttPublisher.publishSnapshots(orderedSnapshots());
+    // MQTT rides the same diff gate: availability + metrics only when the fleet changed.
+    mqttPublisher.publishFleet(mqttFleetEntries());
   }, interval);
 }
 

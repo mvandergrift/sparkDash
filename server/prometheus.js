@@ -420,6 +420,152 @@ function addUnit(samples, entry) {
 }
 
 /**
+ * One unit's readings as a compact JSON object — the same measurements and
+ * omission rules as the Prometheus export, in a shape convenient over MQTT:
+ * `{up, uptime_seconds, gpu[], memory_available_bytes, cpu, ram, net[], disks[],
+ * llm[], collector_last_success_seconds}`. A key is omitted when its reading is
+ * unavailable, so consumers never see fabricated zeros; an unreachable unit
+ * serializes as `{up: 0}`. Accepts a bare snapshot or the wrapped entries
+ * `metricsEntries()` builds (provenance marks a failed collection).
+ * @param {object | { snapshot: object, collected?: { gpu?: boolean, cpu?: boolean }, collectedAt?: Record<string, number> }} entry
+ * @returns {Record<string, unknown>}
+ */
+export function unitMetricJson(entry) {
+  const { snapshot, collected, collectedAt } = normalizeEntry(entry);
+  const out = { up: snapshot?.online === true ? 1 : 0 };
+  if (!snapshot || typeof snapshot !== "object" || !snapshot.id) return out;
+  if (snapshot.online !== true) return out;
+  if (finite(snapshot.uptime)) out.uptime_seconds = snapshot.uptime;
+
+  const collectors = {};
+  for (const [collector, ms] of Object.entries(collectedAt)) {
+    if (finite(ms) && ms > 0) collectors[collector] = ms / 1000;
+  }
+  if (Object.keys(collectors).length) out.collector_last_success_seconds = collectors;
+
+  const metrics = snapshot.metrics || {};
+  const gpu = metrics.gpu;
+  const gpuMeasured = gpu && collected.gpu !== false && !isDefaultGpu(gpu);
+  if (gpuMeasured) {
+    const devices =
+      Array.isArray(gpu.gpus) && gpu.gpus.length > 0
+        ? gpu.gpus
+        : [{ ...gpu, index: 0, name: null, uuid: null }];
+    const gpus = [];
+    for (const device of devices) {
+      const d = {};
+      d.index = finite(device?.index) ? device.index : devices.indexOf(device);
+      if (device?.name) d.name = device.name;
+      if (device?.uuid) d.uuid = device.uuid;
+      if (device?.metricAvailability?.usage !== false && finite(device.usage)) d.utilization_ratio = ratio(device.usage);
+      if (device?.metricAvailability?.temperature !== false && finite(device.temperature)) d.temperature_celsius = device.temperature;
+      if (device?.metricAvailability?.powerDraw !== false && finite(device.power?.draw)) d.power_watts = device.power.draw;
+      if (device?.metricAvailability?.powerLimit !== false && finite(device.power?.limit) && device.power.limit > 0) {
+        d.power_limit_watts = device.power.limit;
+      }
+      const vram = device?.vram;
+      if (vram && finite(vram.total) && vram.total > 0) {
+        if (device?.metricAvailability?.vramUsed !== false && finite(vram.used)) d.memory_used_bytes = bytesFromMib(vram.used);
+        if (device?.metricAvailability?.vramTotal !== false) d.memory_total_bytes = bytesFromMib(vram.total);
+      }
+      const throttle = device?.throttle;
+      if (throttle && typeof throttle === "object" && throttle.reason !== "unknown") {
+        d.throttled = { thermal: throttle.thermal ? 1 : 0, power: throttle.powerCap ? 1 : 0, hw: throttle.hwSlowdown ? 1 : 0 };
+      }
+      gpus.push(d);
+    }
+    out.gpu = gpus;
+  }
+
+  // Headroom: the GB10 shares one pool, so MemAvailable is the real limit; a
+  // discrete card is limited by its own free VRAM (system RAM does not help).
+  if (snapshot.kind === "host") {
+    if (gpuMeasured && finite(gpu.vram?.total) && gpu.vram.total > 0 && finite(gpu.vram?.available)) {
+      out.memory_available_bytes = bytesFromMib(gpu.vram.available);
+    }
+  } else {
+    const um = metrics.unifiedMemory;
+    if (um && finite(um.total) && um.total > 0 && finite(um.available)) {
+      out.memory_available_bytes = bytesFromMib(um.available);
+    }
+  }
+
+  const cpu = metrics.cpu;
+  if (cpu && collected.cpu !== false && !isDefaultCpu(cpu)) {
+    const c = {};
+    if (finite(cpu.usage)) c.utilization_ratio = ratio(cpu.usage);
+    // 0 °C is the collector's "no sensor" value, not a reading.
+    if (finite(cpu.temperature) && cpu.temperature > 0) {
+      c.temperature_celsius = cpu.temperature;
+      if (cpu.temperatureSource) c.temperature_source = cpu.temperatureSource;
+    }
+    if (Object.keys(c).length) out.cpu = c;
+  }
+
+  const ram = metrics.ram;
+  if (ram && finite(ram.total) && ram.total > 0) {
+    out.ram = { total_bytes: bytesFromMib(ram.total) };
+    if (finite(ram.used)) out.ram.used_bytes = bytesFromMib(ram.used);
+  }
+
+  const interfaces = Array.isArray(metrics.network?.interfaces) ? metrics.network.interfaces : [];
+  const net = [];
+  for (const iface of interfaces) {
+    if (!iface?.name || iface.disabled) continue;
+    const n = { interface: iface.name };
+    if (finite(iface.rxSpeed)) n.receive_bytes_per_second = iface.rxSpeed;
+    if (finite(iface.txSpeed)) n.transmit_bytes_per_second = iface.txSpeed;
+    net.push(n);
+  }
+  if (net.length) out.net = net;
+
+  const storage = Array.isArray(metrics.storage) ? metrics.storage : [];
+  const disks = [];
+  for (const disk of storage) {
+    if (!disk || disk.disabled || !finite(disk.total) || disk.total <= 0) continue;
+    const d = { total_bytes: bytesFromMib(disk.total) };
+    if (disk.label) d.mount = disk.label;
+    if (disk.device) d.device = disk.device;
+    if (finite(disk.used)) d.used_bytes = bytesFromMib(disk.used);
+    if (finite(disk.available)) d.available_bytes = bytesFromMib(disk.available);
+    disks.push(d);
+  }
+  if (disks.length) out.disks = disks;
+
+  const llmEntries = Array.isArray(snapshot.metrics?.llm) ? snapshot.metrics.llm : [];
+  const ports = Array.isArray(snapshot.llmPorts) ? snapshot.llmPorts : [];
+  const llm = [];
+  llmEntries.forEach((ll, i) => {
+    if (!ll || typeof ll !== "object") return;
+    // Probe results are in the same order as the snapshot's llmPorts.
+    const port = finite(ll.port) ? ll.port : ports[i];
+    if (!finite(port)) return;
+    const e = { port, up: ll.available === true ? 1 : 0 };
+    if (ll.backend) e.backend = ll.backend;
+    if (ll.modelId) e.model = ll.modelId;
+    if (ll.available !== true) {
+      llm.push(e);
+      return;
+    }
+    if (finite(ll.generationTps)) e.generation_tokens_per_second = ll.generationTps;
+    if (finite(ll.prefillTps)) e.prefill_tokens_per_second = ll.prefillTps;
+    if (finite(ll.kvCacheUsage)) e.kv_cache_usage_ratio = ll.kvCacheUsage;
+    if (finite(ll.requestsRunning)) e.requests_running = ll.requestsRunning;
+    if (finite(ll.requestsWaiting)) e.requests_waiting = ll.requestsWaiting;
+    // Every backend fills totalOutputTokens, but one that publishes no counter
+    // leaves it at 0 — a flat zero is not a measurement, so wait for the first
+    // real count. Prompt and cached totals use null for "not exposed".
+    if (finite(ll.totalOutputTokens) && ll.totalOutputTokens > 0) e.generated_tokens_total = ll.totalOutputTokens;
+    if (finite(ll.totalPromptTokens)) e.prompt_tokens_total = ll.totalPromptTokens;
+    if (finite(ll.totalCachedTokens)) e.cached_prompt_tokens_total = ll.totalCachedTokens;
+    llm.push(e);
+  });
+  if (llm.length) out.llm = llm;
+
+  return out;
+}
+
+/**
  * Render the fleet as Prometheus text exposition format 0.0.4.
  * @param {Array<object | { snapshot: object, collected?: { gpu?: boolean, cpu?: boolean }, collectedAt?: Record<string, number> }>} entries
  *   unit snapshots (SparkMonitor#snapshot()), optionally wrapped with provenance

@@ -59,7 +59,7 @@ test("disabled: no connection is attempted and nothing is published", () => {
   const h = harness({ settings: { mqttEnabled: false } });
   h.publisher.applySettings();
   h.publisher.publishEvent({ type: "spark.offline", message: "x" });
-  h.publisher.publishSnapshots([{ id: "alpha", online: true }]);
+  h.publisher.publishFleet([{ id: "alpha", online: true }]);
   assert.equal(h.attempts.length, 0);
   assert.equal(h.calls.publishes.length, 0);
 });
@@ -123,42 +123,58 @@ test("events stream to {prefix}/events with QoS 1 and the EventLog record verbat
   assert.equal(h.calls.publishes[1].topic, "home/fleet/events");
 });
 
-test("availability is retained 1/0 per Spark in fleet order", () => {
+test("the fleet publishes retained availability plus a metrics payload per unit", () => {
   const h = harness();
   h.publisher.applySettings();
-  h.publisher.publishSnapshots([
-    { id: "alpha", online: true },
-    { id: "beta", online: false },
-    { id: "gamma" }, // no online field counts as down, like sparkdash_up
+  h.publisher.publishFleet([
+    { snapshot: { id: "alpha", online: true, uptime: 100 } }, // wrapped provenance form
+    { id: "beta", online: false }, // bare snapshot
   ]);
-  assert.deepEqual(h.calls.publishes, [
-    { topic: "sparkdash/status/alpha", payload: "1", opts: { retain: true } },
-    { topic: "sparkdash/status/beta", payload: "0", opts: { retain: true } },
-    { topic: "sparkdash/status/gamma", payload: "0", opts: { retain: true } },
-  ]);
+  assert.equal(h.calls.publishes.length, 4);
+  assert.deepEqual(
+    h.calls.publishes.filter((p) => p.topic.startsWith("sparkdash/status/")),
+    [
+      { topic: "sparkdash/status/alpha", payload: "1", opts: { retain: true } },
+      { topic: "sparkdash/status/beta", payload: "0", opts: { retain: true } },
+    ]
+  );
+  // The metrics payload is the unit's Prometheus series as JSON: up + what was measured.
+  assert.equal(h.calls.publishes[1].topic, "sparkdash/metrics/alpha");
+  assert.equal(h.calls.publishes[1].opts.qos, 0);
+  const alpha = JSON.parse(h.calls.publishes[1].payload);
+  assert.equal(typeof alpha.ts, "number");
+  assert.equal(alpha.up, 1);
+  assert.equal(alpha.uptime_seconds, 100);
+  // An offline unit says so on its metrics topic too ("sparkdash_up 0 and nothing else").
+  assert.equal(h.calls.publishes[3].topic, "sparkdash/metrics/beta");
+  const beta = JSON.parse(h.calls.publishes[3].payload);
+  assert.deepEqual(beta, { ts: beta.ts, up: 0 });
 });
 
-test("a Spark id is percent-encoded into its topic", () => {
+test("a Spark id is percent-encoded into its topics", () => {
   const h = harness();
   h.publisher.applySettings();
-  h.publisher.publishSnapshots([{ id: "spark one", online: true }]);
-  assert.equal(h.calls.publishes[0].topic, "sparkdash/status/spark%20one");
+  h.publisher.publishFleet([{ id: "spark one", online: true, uptime: 5 }]);
+  assert.deepEqual(
+    h.calls.publishes.map((p) => p.topic),
+    ["sparkdash/status/spark%20one", "sparkdash/metrics/spark%20one"]
+  );
 });
 
 test("publishes are skipped while the broker is disconnected — never thrown, never queued", () => {
   const h = harness({ client: { connected: false } });
   h.publisher.applySettings();
   h.publisher.publishEvent({ type: "x", message: "y" });
-  h.publisher.publishSnapshots([{ id: "alpha", online: true }]);
+  h.publisher.publishFleet([{ id: "alpha", online: true }]);
   h.fire("connect");
   assert.equal(h.calls.publishes.length, 0);
 });
 
-test("garbage snapshots are ignored", () => {
+test("garbage entries are ignored", () => {
   const h = harness();
   h.publisher.applySettings();
-  h.publisher.publishSnapshots(null);
-  h.publisher.publishSnapshots([null, {}, { online: true }]);
+  h.publisher.publishFleet(null);
+  h.publisher.publishFleet([null, {}, { snapshot: {} }, { online: true }]);
   assert.equal(h.calls.publishes.length, 0);
 });
 
@@ -210,6 +226,6 @@ test("nothing throws when a connect attempt fails outright", () => {
   });
   publisher.applySettings();
   publisher.publishEvent({ type: "x", message: "y" });
-  publisher.publishSnapshots([{ id: "alpha", online: true }]);
+  publisher.publishFleet([{ id: "alpha", online: true }]);
   publisher.stop();
 });
