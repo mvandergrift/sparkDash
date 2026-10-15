@@ -55,7 +55,8 @@ test("mqtt publishing is opt-in with a validated broker URL and topic prefix", (
   assert.equal(updateSettings({ mqttTopicPrefix: "home/fleet" }).mqttTopicPrefix, "home/fleet");
   assert.equal(updateSettings({ mqttTopicPrefix: " bad#topic " }).mqttTopicPrefix, "sparkdash");
   assert.equal(updateSettings({ mqttTopicPrefix: "/leading" }).mqttTopicPrefix, "sparkdash");
-  assert.equal(updateSettings({ mqttTopicPrefix: "trailing/" }).mqttTopicPrefix, "sparkdash");
+  // Trailing slashes are stripped, not rejected (they are normal while typing).
+  assert.equal(updateSettings({ mqttTopicPrefix: "trailing/" }).mqttTopicPrefix, "trailing");
   assert.equal(updateSettings({ mqttTopicPrefix: "+" }).mqttTopicPrefix, "sparkdash");
   assert.equal(updateSettings({ mqttTopicPrefix: "" }).mqttTopicPrefix, "sparkdash");
   assert.equal(updateSettings({ mqttUsername: "  mia " }).mqttUsername, "mia");

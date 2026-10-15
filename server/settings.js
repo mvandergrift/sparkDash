@@ -160,7 +160,9 @@ function _clampSettings(settings) {
       ? s.mqttUrl.trim()
       : "";
   s.mqttUsername = typeof s.mqttUsername === "string" ? s.mqttUsername.trim().slice(0, 128) : "";
-  s.mqttTopicPrefix = isValidMqttPrefix(s.mqttTopicPrefix) ? s.mqttTopicPrefix.trim() : DEFAULTS.mqttTopicPrefix;
+  // Trailing slashes are normal while typing; strip them instead of rejecting.
+  const prefix = typeof s.mqttTopicPrefix === "string" ? s.mqttTopicPrefix.trim().replace(/\/+$/, "") : "";
+  s.mqttTopicPrefix = isValidMqttPrefix(prefix) ? prefix : DEFAULTS.mqttTopicPrefix;
   // Ensure temperatureUnit is valid
   if (s.temperatureUnit !== "celsius" && s.temperatureUnit !== "fahrenheit") {
     s.temperatureUnit = DEFAULTS.temperatureUnit;

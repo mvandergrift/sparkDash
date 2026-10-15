@@ -805,6 +805,14 @@ export interface Settings {
   showVramBreakdown: boolean;
   /** Serve GET /metrics in Prometheus text format. Off by default (404 when off). */
   prometheusExport: boolean;
+  /** Publish the activity feed and per-unit readings to an MQTT broker. Off by default. */
+  mqttEnabled: boolean;
+  /** Broker URL: mqtt://, mqtts://, ws:// or wss://. */
+  mqttUrl: string;
+  /** Broker username, if any; the password comes from SPARKDASH_MQTT_PASSWORD. */
+  mqttUsername: string;
+  /** Topic root for everything published (events, status, metrics). */
+  mqttTopicPrefix: string;
 }
 
 export interface SparksListResponse {

@@ -126,6 +126,11 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
       setError(`"${settings.timeZone}" is not a known time zone (for example Europe/Paris), or clear the field to follow the browser.`);
       return;
     }
+    if (settings.mqttUrl && !/^(mqtt|ws)s?:\/\//i.test(settings.mqttUrl.trim())) {
+      // The server would silently clear it; say so instead.
+      setError(`"${settings.mqttUrl}" is not a broker URL — use mqtt://host:1883 (or mqtts://, ws://, wss://), or clear the field.`);
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -337,6 +342,60 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                 checked={Boolean(settings.prometheusExport)}
                 onChange={(v) => update({ prometheusExport: v })}
               />
+              <ToggleRow
+                title="MQTT publishing"
+                help="Publishes the activity feed events and every unit's readings to your MQTT broker (Home Assistant, Node-RED, …) as they change. Off by default. The README's MQTT section lists the topics."
+                checked={Boolean(settings.mqttEnabled)}
+                onChange={(v) => update({ mqttEnabled: v })}
+              />
+              <SettingRow
+                title="MQTT broker URL"
+                help="mqtt://host:1883, mqtts:// for TLS, ws(s):// for a websocket broker. The password is read from the SPARKDASH_MQTT_PASSWORD environment variable, never stored in settings.json."
+                htmlFor="settings-mqtt-url"
+              >
+                <input
+                  id="settings-mqtt-url"
+                  type="text"
+                  value={settings.mqttUrl ?? ""}
+                  placeholder="mqtt://homeassistant.local:1883"
+                  spellCheck={false}
+                  autoComplete="off"
+                  onChange={(e) => update({ mqttUrl: e.target.value })}
+                  className="field-input"
+                />
+              </SettingRow>
+              <SettingRow
+                title="MQTT username"
+                help="Leave empty for a broker that allows anonymous publish."
+                htmlFor="settings-mqtt-username"
+              >
+                <input
+                  id="settings-mqtt-username"
+                  type="text"
+                  value={settings.mqttUsername ?? ""}
+                  placeholder="empty"
+                  spellCheck={false}
+                  autoComplete="off"
+                  onChange={(e) => update({ mqttUsername: e.target.value })}
+                  className="field-input"
+                />
+              </SettingRow>
+              <SettingRow
+                title="MQTT topic prefix"
+                help="Topic root for everything published: PREFIX/events, PREFIX/status/… and PREFIX/metrics/…"
+                htmlFor="settings-mqtt-prefix"
+              >
+                <input
+                  id="settings-mqtt-prefix"
+                  type="text"
+                  value={settings.mqttTopicPrefix ?? ""}
+                  placeholder="sparkdash"
+                  spellCheck={false}
+                  autoComplete="off"
+                  onChange={(e) => update({ mqttTopicPrefix: e.target.value })}
+                  className="field-input"
+                />
+              </SettingRow>
               <ToggleRow
                 title="Show Fleet Energy"
                 help="Overview card with rolling fleet power estimates. The full Fleet energy page is always available from the sidebar."
