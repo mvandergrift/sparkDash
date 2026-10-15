@@ -98,11 +98,11 @@ test("a full snapshot yields an entity per reading, grouped under one device", (
   assert.equal(temp.unit_of_measurement, "°C");
   assert.equal(temp.device.identifiers[0], "sparkdash_alpha");
   assert.equal(temp.device.name, "Alpha");
-  assert.equal(temp.device.via_device, "sparkdash_dashboard");
+  assert.equal(temp.device.via_device, "sparkdash-dashboard");
   // Availability: the dashboard must be up AND the unit reachable.
   assert.deepEqual(
     temp.availability.map((a) => a.topic),
-    ["sparkdash/status/dashboard", "sparkdash/status/alpha"]
+    ["sparkdash/dashboard/status", "sparkdash/status/alpha"]
   );
   // Ratio → percent and bytes → GB conversions happen in the template.
   assert.match(payloadOf(messages, "gpu_0_utilization").value_template, /utilization_ratio \* 100/);
@@ -113,7 +113,7 @@ test("a full snapshot yields an entity per reading, grouped under one device", (
   assert.equal(online.state_topic, "sparkdash/status/alpha");
   assert.deepEqual(
     online.availability.map((a) => a.topic),
-    ["sparkdash/status/dashboard"]
+    ["sparkdash/dashboard/status"]
   );
 });
 
@@ -163,9 +163,35 @@ test("an AMD card's index (1000 + i) names its entities, like the Prometheus exp
 
 test("the dashboard announces its own connectivity sensor", () => {
   const [only] = dashboardDiscoveryMessages(CTX);
-  assert.equal(only.topic, "homeassistant/binary_sensor/sparkdash_dashboard/connected/config");
+  assert.equal(only.topic, "homeassistant/binary_sensor/sparkdash-dashboard/connected/config");
   const cfg = JSON.parse(only.payload);
-  assert.equal(cfg.state_topic, "sparkdash/status/dashboard");
+  assert.equal(cfg.state_topic, "sparkdash/dashboard/status");
   assert.equal(cfg.device_class, "connectivity");
-  assert.equal(cfg.device.identifiers[0], "sparkdash_dashboard");
+  assert.equal(cfg.device.identifiers[0], "sparkdash-dashboard");
+});
+
+test("unit entities need both the dashboard and the unit to be available", () => {
+  const messages = unitDiscoveryMessages(
+    { id: "alpha", name: "Alpha", kind: "spark", online: true, uptime: 1, metrics: { cpu: { usage: 1 } } },
+    { prefix: "sparkdash", discoveryPrefix: "homeassistant" }
+  );
+  const cpu = JSON.parse(messages.find((m) => m.topic.includes("/cpu_utilization/")).payload);
+  assert.equal(cpu.availability_mode, "all");
+  assert.equal(cpu.availability.length, 2);
+});
+
+test("a unit named \"dashboard\" cannot collide with the dashboard's own device", () => {
+  const unit = unitDiscoveryMessages(
+    { id: "dashboard", name: "Dashboard", kind: "spark", online: true, uptime: 1 },
+    { prefix: "sparkdash", discoveryPrefix: "homeassistant" }
+  );
+  const [dash] = dashboardDiscoveryMessages({ prefix: "sparkdash", discoveryPrefix: "homeassistant" });
+  const dashCfg = JSON.parse(dash.payload);
+  for (const m of unit) {
+    const cfg = JSON.parse(m.payload);
+    assert.notEqual(m.topic, dash.topic);
+    assert.notEqual(cfg.unique_id, dashCfg.unique_id);
+    assert.notDeepEqual(cfg.device.identifiers, dashCfg.device.identifiers);
+    assert.notEqual(cfg.state_topic, dashCfg.state_topic);
+  }
 });

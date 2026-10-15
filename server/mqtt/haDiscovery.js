@@ -1,6 +1,16 @@
 const DEFAULT_DISCOVERY_PREFIX = "homeassistant";
 
 /**
+ * The dashboard's own availability topic and HA ids live outside the per-unit
+ * namespaces (`status/{id}`, `sparkdash_{id}`), so no Spark id — "dashboard"
+ * included — can collide with them.
+ */
+export function dashboardStatusTopic(prefix) {
+  return `${prefix}/dashboard/status`;
+}
+const DASHBOARD_HA_ID = "sparkdash-dashboard";
+
+/**
  * Home Assistant MQTT discovery: the retained config messages that make HA
  * create the entities itself. Every metric entity reads the unit's metrics
  * topic with a guarded value_template (a reading sparkDash could not take
@@ -26,7 +36,7 @@ function metricTopic(prefix, id) {
 function availabilityTopics(prefix, id) {
   return [
     // The dashboard being down means everything is stale, not just one unit.
-    { topic: `${prefix}/status/dashboard`, payload_available: "1", payload_not_available: "0" },
+    { topic: dashboardStatusTopic(prefix), payload_available: "1", payload_not_available: "0" },
     { topic: `${prefix}/status/${encodeURIComponent(id)}`, payload_available: "1", payload_not_available: "0" },
   ];
 }
@@ -37,7 +47,7 @@ function deviceBlock(snap) {
     name: snap.name || snap.id,
     manufacturer: "sparkDash",
     model: snap.kind === "host" ? "GPU host" : "DGX Spark",
-    via_device: "sparkdash_dashboard",
+    via_device: DASHBOARD_HA_ID,
   };
 }
 
@@ -50,6 +60,9 @@ function sensorConfig(out, snap, ctx, component, object, label, extra, stateTopi
       unique_id: `sparkdash_${snap.id}_${object}`,
       state_topic: stateTopic || metricTopic(ctx.prefix, snap.id),
       availability: availabilityTopics(ctx.prefix, snap.id),
+      // Available only while both the dashboard and the unit are up; HA's
+      // default ("latest") would let whichever topic was written last decide.
+      availability_mode: "all",
       device: deviceBlock(snap),
       ...extra,
     }),
@@ -90,7 +103,7 @@ export function unitDiscoveryMessages(snap, ctx) {
     payload_on: "1",
     payload_off: "0",
     device_class: "connectivity",
-    availability: [{ topic: `${ctx.prefix}/status/dashboard`, payload_available: "1", payload_not_available: "0" }],
+    availability: [{ topic: dashboardStatusTopic(ctx.prefix), payload_available: "1", payload_not_available: "0" }],
   });
 
   if (Number.isFinite(snap.uptime)) {
@@ -269,16 +282,16 @@ export function unitDiscoveryMessages(snap, ctx) {
 export function dashboardDiscoveryMessages({ prefix, discoveryPrefix }) {
   return [
     {
-      topic: `${discoveryPrefix}/binary_sensor/sparkdash_dashboard/connected/config`,
+      topic: `${discoveryPrefix}/binary_sensor/${DASHBOARD_HA_ID}/connected/config`,
       payload: JSON.stringify({
         name: "sparkDash dashboard",
-        unique_id: "sparkdash_dashboard_connected",
-        state_topic: `${prefix}/status/dashboard`,
+        unique_id: `${DASHBOARD_HA_ID}_connected`,
+        state_topic: dashboardStatusTopic(prefix),
         payload_on: "1",
         payload_off: "0",
         device_class: "connectivity",
         device: {
-          identifiers: ["sparkdash_dashboard"],
+          identifiers: [DASHBOARD_HA_ID],
           name: "sparkDash",
           manufacturer: "sparkDash",
           model: "Monitoring dashboard",

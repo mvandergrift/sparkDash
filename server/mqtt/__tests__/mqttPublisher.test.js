@@ -43,6 +43,7 @@ function harness({ settings = {}, client: clientOverrides = {} } = {}) {
   });
   return {
     publisher,
+    client,
     calls,
     attempts,
     set(patch) {
@@ -69,18 +70,18 @@ test("applySettings connects, sends credentials, and publishes dashboard availab
   h.publisher.applySettings();
   assert.equal(h.attempts.length, 1);
   assert.equal(h.attempts[0].url, "mqtt://broker.local:1883");
-  assert.match(h.attempts[0].opts.clientId, /^sparkdash-\d+$/);
+  assert.match(h.attempts[0].opts.clientId, /^sparkdash-[0-9a-f]{8}$/);
   assert.equal(h.attempts[0].opts.reconnectPeriod, 5_000);
   // The will mirrors our own availability so a crashed dashboard reads 0 at the broker.
   assert.deepEqual(h.attempts[0].opts.will, {
-    topic: "sparkdash/status/dashboard",
+    topic: "sparkdash/dashboard/status",
     payload: "0",
     qos: 0,
     retain: true,
   });
   h.fire("connect");
   assert.deepEqual(h.calls.publishes, [
-    { topic: "sparkdash/status/dashboard", payload: "1", opts: { retain: true } },
+    { topic: "sparkdash/dashboard/status", payload: "1", opts: { retain: true } },
   ]);
 });
 
@@ -194,7 +195,7 @@ test("a changed broker URL or prefix reopens the connection", () => {
   h.publisher.applySettings();
   assert.equal(h.calls.ended, 2);
   assert.equal(h.attempts.length, 3);
-  assert.equal(h.attempts[2].opts.will.topic, "home/status/dashboard");
+  assert.equal(h.attempts[2].opts.will.topic, "home/dashboard/status");
 });
 
 test("disabling tears the connection down", () => {
@@ -213,7 +214,7 @@ test("stop() marks the dashboard offline and force-closes", () => {
   h.publisher.applySettings();
   h.publisher.stop();
   assert.deepEqual(h.calls.publishes, [
-    { topic: "sparkdash/status/dashboard", payload: "0", opts: { retain: true } },
+    { topic: "sparkdash/dashboard/status", payload: "0", opts: { retain: true } },
   ]);
   assert.equal(h.calls.ended, 1);
   assert.equal(h.calls.endForce, true);
@@ -257,15 +258,12 @@ test("discovery configs are published when the fleet first appears, not on every
   const online = first.find((c) => c.topic.endsWith("binary_sensor/sparkdash_alpha/online/config"));
   assert.ok(online, "no online binary_sensor config");
   assert.equal(JSON.parse(online.payload).state_topic, "sparkdash/status/alpha");
-  const dash = first.find((c) => c.topic.endsWith("binary_sensor/sparkdash_dashboard/connected/config"));
+  const dash = first.find((c) => c.topic.endsWith("binary_sensor/sparkdash-dashboard/connected/config"));
   assert.ok(dash, "no dashboard config");
-  // Same structure again: status + metrics republish, configs do not.
+  // Same fleet again: nothing changed, so nothing is resent.
   const before = h.calls.publishes.length;
   h.publisher.publishFleet(entries);
-  assert.deepEqual(
-    h.calls.publishes.slice(before).map((p) => p.topic),
-    ["sparkdash/status/alpha", "sparkdash/metrics/alpha"]
-  );
+  assert.deepEqual(h.calls.publishes.slice(before), []);
   // A GPU appears: exactly its configs (plus the fleet power sensor) are added.
   const grown = [
     {
@@ -276,7 +274,7 @@ test("discovery configs are published when the fleet first appears, not on every
     },
   ];
   h.publisher.publishFleet(grown);
-  const added = configs(h.calls.publishes.slice(before + 2));
+  const added = configs(h.calls.publishes.slice(before));
   assert.equal(added.length, 5);
   for (const c of added) {
     assert.ok(c.topic.includes("gpu_0_") || c.topic.includes("/power/"), c.topic);
@@ -317,5 +315,60 @@ test("a reconnect re-announces discovery and refreshes the retained state", () =
   const again = h.calls.publishes.slice(afterFirst);
   assert.ok(again.some((p) => p.topic.endsWith("binary_sensor/sparkdash_alpha/online/config")));
   assert.ok(again.some((p) => p.topic === "sparkdash/metrics/alpha"));
-  assert.ok(again.some((p) => p.topic === "sparkdash/status/dashboard" && p.payload === "1"));
+  assert.ok(again.some((p) => p.topic === "sparkdash/dashboard/status" && p.payload === "1"));
+});
+
+test("each publisher gets its own client id (PID is 1 in every container)", () => {
+  const a = harness();
+  const b = harness();
+  a.publisher.applySettings();
+  b.publisher.applySettings();
+  assert.notEqual(a.attempts[0].opts.clientId, b.attempts[0].opts.clientId);
+});
+
+test("status and metrics are resent only when they change, and retried after a skipped publish", () => {
+  const h = harness();
+  h.publisher.applySettings();
+  const at = (uptime) => [{ snapshot: { id: "alpha", online: true, uptime } }];
+  const topics = (from) => h.calls.publishes.slice(from).map((p) => p.topic);
+  h.publisher.publishFleet(at(1));
+  let mark = h.calls.publishes.length;
+  h.publisher.publishFleet(at(2)); // metrics changed, status did not
+  assert.deepEqual(topics(mark), ["sparkdash/metrics/alpha"]);
+  h.client.connected = false;
+  h.publisher.publishFleet([{ id: "alpha", online: false }]); // skipped: broker down
+  h.client.connected = true;
+  mark = h.calls.publishes.length;
+  h.publisher.publishFleet([{ id: "alpha", online: false }]);
+  assert.deepEqual(topics(mark), ["sparkdash/status/alpha", "sparkdash/metrics/alpha"]);
+});
+
+test("discovery removals made while disconnected are sent on reconnect", () => {
+  const h = harness({ settings: DISCOVERY });
+  h.publisher.applySettings();
+  h.publisher.publishFleet([{ snapshot: { id: "alpha", name: "Alpha", kind: "spark", online: true, uptime: 1 } }]);
+  const announced = configs(h.calls.publishes).filter((c) => c.payload !== "").map((c) => c.topic);
+  h.client.connected = false;
+  h.set({ mqttDiscovery: false });
+  h.publisher.applySettings(); // clears discovery while the broker is unreachable
+  h.client.connected = true;
+  const mark = h.calls.publishes.length;
+  h.fire("connect");
+  const removed = configs(h.calls.publishes.slice(mark)).filter((c) => c.payload === "").map((c) => c.topic);
+  assert.deepEqual(removed.sort(), announced.sort());
+  // Flushed once, not on every reconnect.
+  const mark2 = h.calls.publishes.length;
+  h.fire("connect");
+  assert.equal(configs(h.calls.publishes.slice(mark2)).length, 0);
+});
+
+test("a Spark with id \"dashboard\" does not touch the dashboard's availability topic", () => {
+  const h = harness();
+  h.publisher.applySettings();
+  h.fire("connect");
+  const mark = h.calls.publishes.length;
+  h.publisher.publishFleet([{ id: "dashboard", online: false }]);
+  const topics = h.calls.publishes.slice(mark).map((p) => p.topic);
+  assert.deepEqual(topics, ["sparkdash/status/dashboard", "sparkdash/metrics/dashboard"]);
+  assert.ok(!topics.includes("sparkdash/dashboard/status"));
 });

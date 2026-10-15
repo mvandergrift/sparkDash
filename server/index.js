@@ -2308,9 +2308,15 @@ function broadcastPayload(payload) {
   });
 }
 
-/** Fleet entries with per-domain provenance, exactly what /metrics renders. */
-function mqttFleetEntries() {
-  return metricsEntries(registry.sparkIds.map((id) => monitors.get(id)));
+/**
+ * Hand the fleet to the MQTT bridge: entries with per-domain provenance,
+ * exactly what /metrics renders. Built only when MQTT is on, so the default
+ * (off) install pays nothing per tick; the publisher itself resends a topic
+ * only when its value changed.
+ */
+function publishMqttFleet() {
+  if (!getSettings().mqttEnabled) return;
+  mqttPublisher.publishFleet(metricsEntries(registry.sparkIds.map((id) => monitors.get(id))));
 }
 
 /**
@@ -2322,7 +2328,7 @@ function forceBroadcast() {
   const payload = buildSnapshotPayload();
   _lastBroadcastPayload = payload;
   broadcastPayload(payload);
-  mqttPublisher.publishFleet(mqttFleetEntries());
+  publishMqttFleet();
 }
 
 function startBroadcast() {
@@ -2334,8 +2340,7 @@ function startBroadcast() {
     if (_lastBroadcastPayload !== null && payload === _lastBroadcastPayload) return;
     _lastBroadcastPayload = payload;
     broadcastPayload(payload);
-    // MQTT rides the same diff gate: availability + metrics only when the fleet changed.
-    mqttPublisher.publishFleet(mqttFleetEntries());
+    publishMqttFleet();
   }, interval);
 }
 
