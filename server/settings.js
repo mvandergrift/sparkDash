@@ -104,6 +104,10 @@ const DEFAULTS = Object.freeze({
    */
   healthTempWarnC: 85,
   healthTempCriticalC: 90,
+  /** Publish Home Assistant MQTT discovery configs (requires MQTT publishing). */
+  mqttDiscovery: false,
+  /** Discovery prefix — match the integration's setting in Home Assistant. */
+  mqttDiscoveryPrefix: "homeassistant",
 });
 
 const POLL_INTERVAL_MIN_MS = 500;
@@ -269,6 +273,9 @@ function _clampSettings(settings) {
     s.healthTempWarnC = DEFAULTS.healthTempWarnC;
     s.healthTempCriticalC = DEFAULTS.healthTempCriticalC;
   }
+  s.mqttDiscovery = Boolean(s.mqttDiscovery);
+  const discoveryPrefix = typeof s.mqttDiscoveryPrefix === "string" ? s.mqttDiscoveryPrefix.trim().replace(/\/+$/, "") : "";
+  s.mqttDiscoveryPrefix = isValidMqttPrefix(discoveryPrefix) ? discoveryPrefix : DEFAULTS.mqttDiscoveryPrefix;
   // Ensure temperatureUnit is valid
   if (s.temperatureUnit !== "celsius" && s.temperatureUnit !== "fahrenheit") {
     s.temperatureUnit = DEFAULTS.temperatureUnit;
