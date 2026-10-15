@@ -74,6 +74,10 @@ const DEFAULTS = Object.freeze({
   mqttUsername: "",
   /** Topic root for everything published (no wildcards, no slashes at the edges). */
   mqttTopicPrefix: "sparkdash",
+  /** Publish Home Assistant MQTT discovery configs (requires MQTT publishing). */
+  mqttDiscovery: false,
+  /** Discovery prefix — match the integration's setting in Home Assistant. */
+  mqttDiscoveryPrefix: "homeassistant",
 });
 
 const POLL_INTERVAL_MIN_MS = 500;
@@ -163,6 +167,9 @@ function _clampSettings(settings) {
   // Trailing slashes are normal while typing; strip them instead of rejecting.
   const prefix = typeof s.mqttTopicPrefix === "string" ? s.mqttTopicPrefix.trim().replace(/\/+$/, "") : "";
   s.mqttTopicPrefix = isValidMqttPrefix(prefix) ? prefix : DEFAULTS.mqttTopicPrefix;
+  s.mqttDiscovery = Boolean(s.mqttDiscovery);
+  const discoveryPrefix = typeof s.mqttDiscoveryPrefix === "string" ? s.mqttDiscoveryPrefix.trim().replace(/\/+$/, "") : "";
+  s.mqttDiscoveryPrefix = isValidMqttPrefix(discoveryPrefix) ? discoveryPrefix : DEFAULTS.mqttDiscoveryPrefix;
   // Ensure temperatureUnit is valid
   if (s.temperatureUnit !== "celsius" && s.temperatureUnit !== "fahrenheit") {
     s.temperatureUnit = DEFAULTS.temperatureUnit;

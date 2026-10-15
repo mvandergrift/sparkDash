@@ -474,7 +474,7 @@ Opt-in (default **off**). **Settings → MQTT publishing** forwards what sparkDa
 |-------|---------|-----------|
 | `PREFIX/events` | one JSON activity-feed record per event (`id`, `ts`, `type`, `severity`, `sparkId`, `sparkName`, `message`, and `data` where present) | every accepted event, QoS 1 (the same 5 s dedupe as the Activity page applies) |
 | `PREFIX/status/{unitId}` | `1` or `0`, **retained** | whenever the fleet snapshot changes; the last state survives a broker restart and a new subscriber learns it immediately |
-| `PREFIX/metrics/{unitId}` | `{ts, up, …}` — the JSON twin of the unit's Prometheus series (fields below; semantics in [Prometheus](#prometheus)) | whenever the fleet snapshot changes, QoS 0 |
+| `PREFIX/metrics/{unitId}` | `{ts, up, …}` — the JSON twin of the unit's Prometheus series (fields below; semantics in [Prometheus](#prometheus)) | whenever the fleet snapshot changes, QoS 0, **retained** |
 | `PREFIX/status/dashboard` | `1` while sparkDash is connected, `0` as its last-will message, **retained** | on connect, and by the broker if sparkDash dies uncleanly |
 
 `PREFIX/metrics/{unitId}` is one unit's readings in a nested shape — `{ts, up, uptime_seconds, gpu: [{index, name, uuid, utilization_ratio, temperature_celsius, power_watts, power_limit_watts, memory_used_bytes, memory_total_bytes, throttled: {thermal, power, hw}}], memory_available_bytes, cpu: {utilization_ratio, temperature_celsius, temperature_source}, ram: {used_bytes, total_bytes}, net: [{interface, receive_bytes_per_second, transmit_bytes_per_second}], disks: [{mount, device, used_bytes, available_bytes, total_bytes}], llm: [{port, backend, model, up, generation_tokens_per_second, prefill_tokens_per_second, kv_cache_usage_ratio, requests_running, requests_waiting, generated_tokens_total, prompt_tokens_total, cached_prompt_tokens_total}], collector_last_success_seconds}`. An unreachable unit publishes `{ts, up: 0}` on its metrics topic, and a reading the collectors could not take is omitted rather than reported as zero — the same rules `/metrics` follows.
@@ -484,6 +484,12 @@ mosquitto_sub -h homeassistant.local -t 'sparkdash/#' -v
 ```
 
 Publishing is best-effort: while the broker is unreachable sparkDash retries every 5 s in the background and drops messages instead of queueing them, so a long outage leaves a gap rather than a backlog, and nothing on the publish path can block a poll loop (warnings are rate-limited to one line per 30 s). For Home Assistant, `PREFIX/status/{unitId}` drives a binary sensor and each `PREFIX/metrics/{unitId}` key maps to a template sensor; for Node-RED the JSON is directly `msg.payload`.
+
+### Home Assistant
+
+**Settings → Home Assistant discovery** (`mqttDiscovery`, off by default) publishes retained discovery configs under the discovery prefix (default `homeassistant`, matching the MQTT integration's setting), so Home Assistant creates everything by itself: one **device per unit** (the dashboard is its `via_device`) with sensors for CPU utilization and temperature, RAM used, memory available, board power, one set per GPU (utilization, temperature, power, memory used), one set per LLM endpoint (up, generation/prefill tok/s, KV cache, running requests), per-interface traffic, per-disk usage and an **online** binary sensor — plus a **sparkDash dashboard** connectivity sensor for the dashboard itself, whose last will marks it down if sparkDash dies.
+
+Entity states come from the same `PREFIX/metrics/{unitId}` and `PREFIX/status/{unitId}` topics as everything else; the metrics payloads are retained, so a freshly restarted Home Assistant shows the last values immediately. Each entity is **unavailable** unless the dashboard is connected *and* the unit is online — an offline unit reads unavailable, not stale. Entities appear when a unit, GPU, LLM port, interface or disk appears, and are removed when it goes away; if sparkDash was not connected to the broker at that moment, delete the leftover entity in Home Assistant (Settings → Devices & services → the sparkDash device). A reading the collectors could not take renders nothing, so the entity shows unknown instead of a fabricated zero.
 
 ---
 
@@ -828,6 +834,8 @@ Gear icon in the header, or `GET`/`PUT` `/api/settings`:
 | Save benchmark debug traces | false | Store prompts, HTTP ids and GPU samples in bench history (larger files) |
 | Prometheus metrics | false | Serve `GET /metrics` for Prometheus / Grafana (see [Prometheus](#prometheus)); `404` while off |
 | MQTT publishing | false | Publish the activity feed, per-unit availability and readings to an MQTT broker as they change (see [MQTT](#mqtt)); broker URL, username and topic prefix are set in the same dialog |
+| Home Assistant discovery | false | Publish retained MQTT discovery configs so Home Assistant creates the devices and sensors itself (see [MQTT](#mqtt)) |
+| Discovery prefix | `homeassistant` | Topic prefix for the discovery configs; must match the MQTT integration's setting in Home Assistant |
 
 ### Environment variables
 

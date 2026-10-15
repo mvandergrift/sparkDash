@@ -138,15 +138,18 @@ test("the fleet publishes retained availability plus a metrics payload per unit"
       { topic: "sparkdash/status/beta", payload: "0", opts: { retain: true } },
     ]
   );
-  // The metrics payload is the unit's Prometheus series as JSON: up + what was measured.
+  // The metrics payload is the unit's Prometheus series as JSON: up + what was
+  // measured. Retained, so a fresh subscriber sees the last state immediately.
   assert.equal(h.calls.publishes[1].topic, "sparkdash/metrics/alpha");
   assert.equal(h.calls.publishes[1].opts.qos, 0);
+  assert.equal(h.calls.publishes[1].opts.retain, true);
   const alpha = JSON.parse(h.calls.publishes[1].payload);
   assert.equal(typeof alpha.ts, "number");
   assert.equal(alpha.up, 1);
   assert.equal(alpha.uptime_seconds, 100);
   // An offline unit says so on its metrics topic too ("sparkdash_up 0 and nothing else").
   assert.equal(h.calls.publishes[3].topic, "sparkdash/metrics/beta");
+  assert.equal(h.calls.publishes[3].opts.retain, true);
   const beta = JSON.parse(h.calls.publishes[3].payload);
   assert.deepEqual(beta, { ts: beta.ts, up: 0 });
 });
@@ -228,4 +231,91 @@ test("nothing throws when a connect attempt fails outright", () => {
   publisher.publishEvent({ type: "x", message: "y" });
   publisher.publishFleet([{ id: "alpha", online: true }]);
   publisher.stop();
+});
+
+const DISCOVERY = { mqttDiscovery: true, mqttDiscoveryPrefix: "homeassistant" };
+
+/** Config messages only (the `…/config` topics Home Assistant listens on). */
+function configs(publishes) {
+  return publishes.filter((p) => p.topic.endsWith("/config"));
+}
+
+test("discovery is opt-in even when publishing is on", () => {
+  const h = harness();
+  h.publisher.applySettings();
+  h.publisher.publishFleet([{ snapshot: { id: "alpha", name: "Alpha", kind: "spark", online: true, uptime: 1 } }]);
+  assert.equal(configs(h.calls.publishes).length, 0);
+});
+
+test("discovery configs are published when the fleet first appears, not on every tick", () => {
+  const h = harness({ settings: DISCOVERY });
+  h.publisher.applySettings();
+  const entries = [{ snapshot: { id: "alpha", name: "Alpha", kind: "spark", online: true, uptime: 10 } }];
+  h.publisher.publishFleet(entries);
+  const first = configs(h.calls.publishes);
+  assert.ok(first.length >= 3); // online, uptime + the dashboard's own sensor
+  const online = first.find((c) => c.topic.endsWith("binary_sensor/sparkdash_alpha/online/config"));
+  assert.ok(online, "no online binary_sensor config");
+  assert.equal(JSON.parse(online.payload).state_topic, "sparkdash/status/alpha");
+  const dash = first.find((c) => c.topic.endsWith("binary_sensor/sparkdash_dashboard/connected/config"));
+  assert.ok(dash, "no dashboard config");
+  // Same structure again: status + metrics republish, configs do not.
+  const before = h.calls.publishes.length;
+  h.publisher.publishFleet(entries);
+  assert.deepEqual(
+    h.calls.publishes.slice(before).map((p) => p.topic),
+    ["sparkdash/status/alpha", "sparkdash/metrics/alpha"]
+  );
+  // A GPU appears: exactly its configs (plus the fleet power sensor) are added.
+  const grown = [
+    {
+      snapshot: {
+        ...entries[0].snapshot,
+        metrics: { gpu: { gpus: [{ index: 0, usage: 5, temperature: 40, power: { draw: 9 }, vram: { used: 1, total: 2 } }] } },
+      },
+    },
+  ];
+  h.publisher.publishFleet(grown);
+  const added = configs(h.calls.publishes.slice(before + 2));
+  assert.equal(added.length, 5);
+  for (const c of added) {
+    assert.ok(c.topic.includes("gpu_0_") || c.topic.includes("/power/"), c.topic);
+  }
+});
+
+test("a unit removed from the fleet gets its discovery configs emptied", () => {
+  const h = harness({ settings: DISCOVERY });
+  h.publisher.applySettings();
+  h.publisher.publishFleet([{ snapshot: { id: "alpha", name: "Alpha", kind: "spark", online: true, uptime: 1 } }]);
+  h.publisher.publishFleet([]);
+  const removed = configs(h.calls.publishes).filter((c) => c.payload === "");
+  assert.ok(removed.length > 0);
+  for (const r of removed) {
+    assert.match(r.topic, /homeassistant\/(sensor|binary_sensor)\/sparkdash_alpha\//);
+  }
+});
+
+test("an offline unit keeps its entities — its availability topic reports the outage", () => {
+  const h = harness({ settings: DISCOVERY });
+  h.publisher.applySettings();
+  h.publisher.publishFleet([{ snapshot: { id: "alpha", name: "Alpha", kind: "spark", online: true, uptime: 1 } }]);
+  const before = h.calls.publishes.length;
+  h.publisher.publishFleet([{ id: "alpha", online: false }]);
+  assert.equal(configs(h.calls.publishes.slice(before)).length, 0);
+  assert.deepEqual(
+    h.calls.publishes.slice(before).filter((p) => p.topic === "sparkdash/status/alpha").map((p) => p.payload),
+    ["0"]
+  );
+});
+
+test("a reconnect re-announces discovery and refreshes the retained state", () => {
+  const h = harness({ settings: DISCOVERY });
+  h.publisher.applySettings();
+  h.publisher.publishFleet([{ snapshot: { id: "alpha", name: "Alpha", kind: "spark", online: true, uptime: 1 } }]);
+  const afterFirst = h.calls.publishes.length;
+  h.fire("connect"); // like a restarted broker handing the session back
+  const again = h.calls.publishes.slice(afterFirst);
+  assert.ok(again.some((p) => p.topic.endsWith("binary_sensor/sparkdash_alpha/online/config")));
+  assert.ok(again.some((p) => p.topic === "sparkdash/metrics/alpha"));
+  assert.ok(again.some((p) => p.topic === "sparkdash/status/dashboard" && p.payload === "1"));
 });

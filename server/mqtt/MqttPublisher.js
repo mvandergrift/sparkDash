@@ -1,5 +1,6 @@
 import mqtt from "mqtt";
 import { unitMetricJson } from "../prometheus.js";
+import { unitDiscoveryMessages, dashboardDiscoveryMessages, DEFAULT_DISCOVERY_PREFIX } from "./haDiscovery.js";
 
 const LOG_QUIET_MS = 30_000;
 const DEFAULT_PREFIX = "sparkdash";
@@ -10,8 +11,13 @@ const DEFAULT_PREFIX = "sparkdash";
  *
  *   {prefix}/events            one JSON EventLog record per accepted event
  *   {prefix}/status/{sparkId}  retained "1"/"0", mirroring sparkdash_up
- *   {prefix}/metrics/{sparkId} JSON twin of the unit's Prometheus series
+ *   {prefix}/metrics/{sparkId} retained JSON twin of the unit's Prometheus series
  *   {prefix}/status/dashboard  retained "1" while connected, LWT "0" otherwise
+ *   {discovery}/…/config       Home Assistant discovery, when enabled
+ *
+ * Discovery configs are published retained when a unit's structure changes (a
+ * GPU, LLM port, interface or disk appearing or the unit being added or
+ * removed) and re-announced on reconnect, so a broker restart self-heals.
  *
  * Publishing never throws and never blocks a poll loop: while the broker is
  * unreachable the client keeps retrying on its own and publishes are skipped
@@ -34,6 +40,15 @@ export class MqttPublisher {
     this._base = null;
     this._user = null;
     this._lastQuietLog = 0;
+    /** Per-unit discovery configs already at the broker, and whether the dashboard's own was announced this connection. */
+    /** @type {Map<string, { json: string, messages: Array<{ topic: string, payload: string }> }>} */
+    this._discoveryByUnit = new Map();
+    this._discoveryAnnounced = false;
+    this._discoveryPrefixInUse = null;
+    /** @type {Array<{ topic: string, payload: string }> | null} */
+    this._dashboardDiscovery = null;
+    /** Last fleet entries seen, so a reconnect can refresh retained state at the broker. */
+    this._lastFleet = null;
   }
 
   /**
@@ -43,6 +58,7 @@ export class MqttPublisher {
    */
   applySettings() {
     const s = this._getSettings();
+    if (!s.mqttDiscovery) this._clearDiscovery();
     if (!s.mqttEnabled || !s.mqttUrl) return this._teardown();
     const base = this._prefix();
     const user = s.mqttUsername || "";
@@ -72,6 +88,8 @@ export class MqttPublisher {
     this._client.on("connect", () => {
       // Fired on every (re)connect; retain keeps the last state across broker restarts.
       this._publish(`${base}/status/dashboard`, "1", { retain: true });
+      // A restarted broker lost the retained discovery configs and state.
+      this._republishDiscovery();
     });
     this._client.on("error", (err) => this._quietLog(`broker error: ${err?.message}`));
     // "close" / "reconnect" are expected — MQTT.js retries with reconnectPeriod.
@@ -96,6 +114,7 @@ export class MqttPublisher {
   publishFleet(entries) {
     const s = this._getSettings();
     if (!s.mqttEnabled || !Array.isArray(entries)) return;
+    this._lastFleet = entries;
     const base = this._prefix();
     for (const entry of entries) {
       const snap = entry && typeof entry === "object" && entry.snapshot ? entry.snapshot : entry;
@@ -105,8 +124,92 @@ export class MqttPublisher {
       this._publish(`${base}/status/${id}`, up ? "1" : "0", { retain: true });
       const json = unitMetricJson(entry);
       const payload = { ts: Date.now(), ...json };
-      this._publish(`${base}/metrics/${id}`, JSON.stringify(payload), { qos: 0 });
+      // Retained, so a freshly (re)started Home Assistant sees the last state
+      // immediately; the availability topics say how stale it may be.
+      this._publish(`${base}/metrics/${id}`, JSON.stringify(payload), { qos: 0, retain: true });
     }
+    if (s.mqttDiscovery) this._syncDiscovery(entries, base, s.mqttDiscoveryPrefix || DEFAULT_DISCOVERY_PREFIX);
+  }
+
+  /**
+   * Bring the discovery configs at the broker in line with the fleet. An
+   * offline unit keeps its entities (its availability topic says unavailable);
+   * a unit removed from the fleet gets its configs emptied. Configs are
+   * republished only when a unit's structure changes, so the every-tick
+   * publishFleet cost is one small comparison.
+   */
+  _syncDiscovery(entries, base, discoveryPrefix) {
+    if (this._discoveryPrefixInUse !== discoveryPrefix) {
+      this._clearDiscovery();
+      this._discoveryPrefixInUse = discoveryPrefix;
+    }
+    const seen = new Set();
+    for (const entry of entries) {
+      const snap = entry && typeof entry === "object" && entry.snapshot ? entry.snapshot : entry;
+      if (!snap?.id) continue;
+      seen.add(snap.id);
+      if (snap.online !== true) continue;
+      const messages = unitDiscoveryMessages(snap, { prefix: base, discoveryPrefix });
+      const json = JSON.stringify(messages);
+      const cached = this._discoveryByUnit.get(snap.id);
+      if (cached?.json === json) continue;
+      // Publish only what is new or changed; topics that vanished are removed.
+      const cachedByTopic = new Map((cached?.messages ?? []).map((m) => [m.topic, m.payload]));
+      for (const m of messages) {
+        if (cachedByTopic.get(m.topic) !== m.payload) this._publish(m.topic, m.payload, { retain: true, qos: 1 });
+      }
+      for (const m of cached?.messages ?? []) {
+        if (!messages.some((n) => n.topic === m.topic)) this._removeDiscovery(m.topic);
+      }
+      this._discoveryByUnit.set(snap.id, { messages, json });
+    }
+    for (const [id, cached] of this._discoveryByUnit) {
+      if (seen.has(id)) continue;
+      for (const m of cached.messages) this._removeDiscovery(m.topic);
+      this._discoveryByUnit.delete(id);
+    }
+    if (!this._discoveryAnnounced) {
+      this._dashboardDiscovery = dashboardDiscoveryMessages({ prefix: base, discoveryPrefix });
+      for (const m of this._dashboardDiscovery) this._publish(m.topic, m.payload, { retain: true, qos: 1 });
+      this._discoveryAnnounced = true;
+    }
+  }
+
+  /** Re-announce cached configs after a reconnect (the broker may have lost them). */
+  _republishDiscovery() {
+    const s = this._getSettings();
+    if (!s.mqttEnabled || !s.mqttDiscovery) return;
+    const base = this._prefix();
+    const discoveryPrefix = s.mqttDiscoveryPrefix || DEFAULT_DISCOVERY_PREFIX;
+    if (this._discoveryPrefixInUse !== discoveryPrefix) {
+      this._clearDiscovery();
+      this._discoveryPrefixInUse = discoveryPrefix;
+    }
+    for (const { messages } of this._discoveryByUnit.values()) {
+      for (const m of messages) this._publish(m.topic, m.payload, { retain: true, qos: 1 });
+    }
+    this._dashboardDiscovery = dashboardDiscoveryMessages({ prefix: base, discoveryPrefix });
+    for (const m of this._dashboardDiscovery) this._publish(m.topic, m.payload, { retain: true, qos: 1 });
+    this._discoveryAnnounced = true;
+    // Refresh the state the configs point at with the last known fleet.
+    if (this._lastFleet) this.publishFleet(this._lastFleet);
+  }
+
+  /** An empty retained payload removes a Home Assistant entity. */
+  _removeDiscovery(topic) {
+    this._publish(topic, "", { retain: true, qos: 1 });
+  }
+
+  _clearDiscovery() {
+    for (const { messages } of this._discoveryByUnit.values()) {
+      for (const m of messages) this._removeDiscovery(m.topic);
+    }
+    this._discoveryByUnit.clear();
+    if (this._dashboardDiscovery) {
+      for (const m of this._dashboardDiscovery) this._removeDiscovery(m.topic);
+      this._dashboardDiscovery = null;
+    }
+    this._discoveryAnnounced = false;
   }
 
   /** Graceful shutdown: flip our own availability to 0, then force-close. */
@@ -138,6 +241,7 @@ export class MqttPublisher {
     this._url = null;
     this._base = null;
     this._user = null;
+    this._discoveryAnnounced = false;
     if (!client) return;
     try {
       client.end(true); // force: don't wait on in-flight QoS acks during teardown

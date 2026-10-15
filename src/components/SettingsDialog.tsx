@@ -397,6 +397,28 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                 />
               </SettingRow>
               <ToggleRow
+                title="Home Assistant discovery"
+                help="Publishes retained discovery configs, so Home Assistant creates a device per unit with its sensors automatically. Requires MQTT publishing above."
+                checked={Boolean(settings.mqttDiscovery)}
+                onChange={(v) => update({ mqttDiscovery: v })}
+              />
+              <SettingRow
+                title="Discovery prefix"
+                help="Must match the MQTT integration's discovery prefix in Home Assistant (default homeassistant)."
+                htmlFor="settings-mqtt-discovery-prefix"
+              >
+                <input
+                  id="settings-mqtt-discovery-prefix"
+                  type="text"
+                  value={settings.mqttDiscoveryPrefix ?? ""}
+                  placeholder="homeassistant"
+                  spellCheck={false}
+                  autoComplete="off"
+                  onChange={(e) => update({ mqttDiscoveryPrefix: e.target.value })}
+                  className="field-input"
+                />
+              </SettingRow>
+              <ToggleRow
                 title="Show Fleet Energy"
                 help="Overview card with rolling fleet power estimates. The full Fleet energy page is always available from the sidebar."
                 checked={Boolean(settings.showFleetEnergy)}
