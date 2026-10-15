@@ -22,6 +22,7 @@ import {
 import { authStatus, authorizeUpgrade, createAuthMiddleware, createHostGuardMiddleware, isLoopbackBind, setTailscaleName } from "./auth.js";
 import { inspectHealth } from "./health.js";
 import { getSettings, updateSettings, loadSettings } from "./settings.js";
+import { MqttPublisher } from "./mqtt/MqttPublisher.js";
 import { broadcastForLanIp, effectiveMac, normalizeMac, sendWol } from "./wol.js";
 import { remoteShutdownCommand, spawnLocalShutdown } from "./shutdown.js";
 import { GpuClockManager } from "./gpuclock/GpuClockManager.js";
@@ -304,6 +305,13 @@ const eventLog = new EventLog({
   // The Activity page browses history, so keep far more than the Overview card shows.
   max: 2000,
 });
+
+// ─── MQTT bridge (opt-in, Settings → MQTT) ───────────────
+// Republishes the event stream and per-Spark availability to a broker the
+// user configures. Best-effort: a down broker drops messages rather than
+// ever blocking a poll loop (the client retries on its own in the meantime).
+const mqttPublisher = new MqttPublisher({ getSettings });
+eventLog.subscribe((event) => mqttPublisher.publishEvent(event));
 
 // ─── GPU history (so a fresh page can draw the last hours at once) ─────
 // Two stores: the dense one keeps every ~2 s sample for the short Overview/Spark charts
@@ -758,6 +766,8 @@ app.put("/api/settings", (req, res) => {
       }
       restartBroadcast();
     }
+    // MQTT broker URL / prefix / enablement changed: reconnect (a no-op otherwise).
+    mqttPublisher.applySettings();
     res.json({ ...newSettings, inferenceActivityEnabled: inferenceActivity.enabled });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -2307,6 +2317,7 @@ function forceBroadcast() {
   const payload = buildSnapshotPayload();
   _lastBroadcastPayload = payload;
   broadcastPayload(payload);
+  mqttPublisher.publishSnapshots(orderedSnapshots());
 }
 
 function startBroadcast() {
@@ -2318,6 +2329,8 @@ function startBroadcast() {
     if (_lastBroadcastPayload !== null && payload === _lastBroadcastPayload) return;
     _lastBroadcastPayload = payload;
     broadcastPayload(payload);
+    // Availability topics ride the same diff gate: only when the fleet changed.
+    mqttPublisher.publishSnapshots(orderedSnapshots());
   }, interval);
 }
 
@@ -2332,6 +2345,7 @@ function restartBroadcast() {
 
 // ─── Start ───────────────────────────────────────────────
 loadSettings();
+mqttPublisher.applySettings();
 const startupPreflight = inspectStartupPreflight(BIND_HOST);
 logStartupPreflight(startupPreflight, BIND_HOST, PORT);
 
@@ -2392,6 +2406,11 @@ async function shutdown(signal) {
     eventLog.flush();
   } catch (err) {
     console.error("[sparkDash] failed to flush event log:", err.message);
+  }
+  try {
+    mqttPublisher.stop();
+  } catch (err) {
+    console.error("[sparkDash] failed to stop MQTT publisher:", err.message);
   }
   try {
     clearInterval(gpuHistoryTimer);
