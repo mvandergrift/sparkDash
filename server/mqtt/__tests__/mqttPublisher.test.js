@@ -6,11 +6,13 @@ import { test } from "node:test";
 import { strict as assert } from "node:assert";
 import {
   ACK_TIMEOUT_MS,
+  DISCOVERY_SWEEP_SETTLE_MS,
   MAX_IN_FLIGHT,
   MAX_PENDING_DISCOVERY_REMOVALS,
   MAX_PENDING_REMOVALS,
   MqttPublisher,
 } from "../MqttPublisher.js";
+import { unitDiscoveryMessages } from "../haDiscovery.js";
 
 /**
  * Stub mqtt.js client capturing the calls the publisher makes. With `autoAck`
@@ -18,9 +20,19 @@ import {
  * in `calls.pending` until the test calls `ack()`.
  */
 function fakeClient({ autoAck = true, ...overrides } = {}) {
-  const calls = { publishes: [], pending: [], ended: 0, endForce: null, handlers: {} };
+  const calls = { publishes: [], pending: [], ended: 0, endForce: null, handlers: {}, subscribes: [], unsubscribes: [] };
   const client = {
     connected: true,
+    /** What the broker answers a SUBSCRIBE with; set to an Error to refuse it. */
+    subackError: null,
+    subscribe(topic, opts, cb) {
+      calls.subscribes.push({ topic, opts: opts ?? {} });
+      if (client.subackError) cb?.(client.subackError);
+      else cb?.(null, [{ topic, qos: opts?.qos ?? 0 }]);
+    },
+    unsubscribe(topic) {
+      calls.unsubscribes.push(topic);
+    },
     publish(topic, payload, opts, cb) {
       calls.publishes.push({ topic, payload: String(payload), opts: opts ?? {} });
       if (autoAck) cb?.();
@@ -68,8 +80,8 @@ function harness({ settings = {}, client: clientOverrides = {}, now } = {}) {
       current = { ...current, ...patch };
     },
     /** Fire a lifecycle event on the stub client, like mqtt.js would. */
-    fire(event, arg) {
-      calls.handlers[event]?.(arg);
+    fire(event, ...args) {
+      calls.handlers[event]?.(...args);
     },
     /** Connect, let the broker accept, and forget the availability announcement. */
     ready() {
@@ -776,4 +788,137 @@ test("at most MAX_PENDING_DISCOVERY_REMOVALS discovery removals are kept", () =>
   }
   assert.equal(sent, MAX_PENDING_DISCOVERY_REMOVALS);
   assert.ok(h.warnings.some((w) => w.includes("discovery removals awaiting the broker")));
+});
+
+// ─── Connect-time discovery sweep ────────────────────────
+
+/** The broker replaying one retained message to the sweep subscription. */
+function replay(h, topic, payload) {
+  h.fire("message", topic, Buffer.from(payload), { retain: true });
+}
+
+/** Retained configs a unit would have left at the broker, built the way the publisher builds them. */
+function leftover(snapshot, { prefix = "sparkdash", discoveryPrefix = "homeassistant" } = {}) {
+  return unitDiscoveryMessages(snapshot, { prefix, discoveryPrefix });
+}
+
+const withGpu = { metrics: { gpu: { usage: 10, gpus: [{ index: 0, usage: 10 }] } } };
+
+/** A publisher connected with a controllable clock; the sweep subscription is already accepted. */
+function sweepHarness(settings = DISCOVERY) {
+  let clock = 1_000_000;
+  const h = harness({ settings, now: () => clock });
+  h.ready();
+  h.settle = () => {
+    clock += DISCOVERY_SWEEP_SETTLE_MS;
+  };
+  return h;
+}
+
+test("every connect subscribes to the discovery prefix, without automatic resubscription", () => {
+  const h = sweepHarness();
+  assert.deepEqual(h.calls.subscribes, [{ topic: "homeassistant/+/+/+/config", opts: { qos: 0 } }]);
+  assert.equal(h.attempts[0].opts.resubscribe, false);
+  h.fire("connect");
+  assert.equal(h.calls.subscribes.length, 2);
+});
+
+test("after a restart, configs left for a removed unit or removed hardware are emptied once the sweep settles", () => {
+  const h = sweepHarness();
+  const alphaNow = leftover(alpha().snapshot);
+  const alphaGpu = leftover({ ...alpha().snapshot, ...withGpu }).filter((m) => m.topic.includes("gpu_") || m.topic.includes("/power/"));
+  const beta = leftover({ id: "beta", name: "Beta", kind: "spark", uptime: 5 });
+  for (const m of [...alphaNow, ...alphaGpu, ...beta]) replay(h, m.topic, m.payload);
+  // Still collecting: nothing is removed yet, so nothing flaps.
+  h.publisher.publishFleet([alpha()]);
+  assert.deepEqual(clears(h), []);
+  h.settle();
+  const mark = h.calls.publishes.length;
+  h.publisher.publishFleet([alpha()]);
+  assert.deepEqual(clears(h, mark).sort(), [...alphaGpu, ...beta].map((m) => m.topic).sort());
+  assert.deepEqual(h.calls.unsubscribes, ["homeassistant/+/+/+/config"]);
+  // One sweep per connect.
+  const mark2 = h.calls.publishes.length;
+  h.publisher.publishFleet([alpha()]);
+  assert.deepEqual(clears(h, mark2), []);
+});
+
+test("a unit offline since the restart keeps the entities the sweep found for it", () => {
+  const h = sweepHarness();
+  const left = leftover({ ...alpha().snapshot, ...withGpu });
+  for (const m of left) replay(h, m.topic, m.payload);
+  h.settle();
+  const offline = alpha({ online: false });
+  h.publisher.publishFleet([offline]);
+  h.publisher.publishFleet([offline]);
+  assert.deepEqual(clears(h), []);
+  // Adopted, so the unit's removal still cleans them up.
+  const mark = h.calls.publishes.length;
+  h.publisher.publishFleet([]);
+  assert.deepEqual(clears(h, mark).sort(), left.map((m) => m.topic).sort());
+});
+
+test("discovery switched off while MQTT was off: the next connect's sweep removes the entities", () => {
+  const h = sweepHarness();
+  h.publisher.publishFleet([alpha()]);
+  const announced = configs(h).map((c) => ({ topic: c.topic, payload: c.payload }));
+  h.set({ mqttEnabled: false });
+  h.publisher.applySettings();
+  h.set({ mqttDiscovery: false });
+  h.publisher.applySettings();
+  h.set({ mqttEnabled: true });
+  h.publisher.applySettings();
+  h.fire("connect");
+  for (const m of announced) replay(h, m.topic, m.payload);
+  h.settle();
+  const mark = h.calls.publishes.length;
+  h.publisher.publishFleet([alpha()]);
+  assert.deepEqual(clears(h, mark).sort(), announced.map((m) => m.topic).sort());
+});
+
+test("an offline unit's entities move with a discovery prefix change", () => {
+  const h = sweepHarness();
+  h.publisher.publishFleet([alpha()]);
+  const old = configs(h).filter((c) => c.topic.includes("sparkdash_alpha"));
+  h.publisher.publishFleet([alpha({ online: false })]);
+  h.set({ mqttDiscoveryPrefix: "ha" });
+  h.publisher.applySettings();
+  const mark = h.calls.publishes.length;
+  h.publisher.publishFleet([alpha({ online: false })]);
+  const unit = (list) => list.filter((t) => t.includes("sparkdash_alpha")).sort();
+  assert.deepEqual(unit(clears(h, mark)), old.map((c) => c.topic).sort());
+  const moved = configs(h, mark).filter((c) => c.payload !== "");
+  assert.deepEqual(unit(moved.map((c) => c.topic)), old.map((c) => c.topic.replace(/^homeassistant\//, "ha/")).sort());
+  // Same payloads: the unit's hardware is not known while it is offline.
+  for (const c of old) assert.equal(moved.find((m) => m.topic.endsWith(c.topic.slice("homeassistant".length))).payload, c.payload);
+});
+
+test("the sweep leaves other integrations, other dashboards and live publishes alone", () => {
+  const h = sweepHarness({ ...DISCOVERY, mqttDiscovery: false });
+  // Another integration's device.
+  replay(h, "homeassistant/sensor/zigbee_lamp/state/config", JSON.stringify({ state_topic: "z2m/lamp" }));
+  // Another sparkDash on the same broker, under its own topic prefix.
+  for (const m of leftover({ id: "gamma", uptime: 1 }, { prefix: "lab" })) replay(h, m.topic, m.payload);
+  // Not a config, and not JSON.
+  replay(h, "homeassistant/sensor/sparkdash_x/thing/config", "not json");
+  // A live (non-retained) publish of one of ours is not a leftover.
+  const ours = leftover({ id: "delta", uptime: 1 });
+  h.fire("message", ours[0].topic, Buffer.from(ours[0].payload), { retain: false });
+  h.settle();
+  h.publisher.publishFleet([]);
+  assert.deepEqual(clears(h), []);
+});
+
+test("a broker that refuses the sweep subscription only skips the sweep", () => {
+  let clock = 0;
+  const h = harness({ settings: DISCOVERY, now: () => clock });
+  h.client.subackError = Object.assign(new Error("Subscribe error: Not authorized"), { code: 135 });
+  h.ready();
+  const m = leftover({ id: "beta", uptime: 1 })[0];
+  replay(h, m.topic, m.payload);
+  clock += DISCOVERY_SWEEP_SETTLE_MS;
+  h.publisher.publishFleet([alpha()]);
+  assert.deepEqual(clears(h), []);
+  assert.ok(configs(h).some((c) => c.topic === ONLINE_CONFIG));
+  assert.deepEqual(h.calls.unsubscribes, []);
 });

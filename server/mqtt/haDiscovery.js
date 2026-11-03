@@ -294,4 +294,48 @@ export function dashboardDiscoveryMessages({ prefix, discoveryPrefix }) {
   ];
 }
 
-export { DEFAULT_DISCOVERY_PREFIX };
+/**
+ * The broker-wide subscription that finds every discovery config under a prefix.
+ * Ours always carry a node id, so `{prefix}/{component}/{node}/{object}/config`.
+ */
+export function discoverySweepFilter(discoveryPrefix) {
+  return `${discoveryPrefix}/+/+/+/config`;
+}
+
+/**
+ * The HA node id of a discovery topic under `discoveryPrefix`, when it is one
+ * sparkDash could have written (`sparkdash_{unit}` or the dashboard's); null otherwise.
+ */
+export function sparkdashDiscoveryNode(topic, discoveryPrefix) {
+  if (typeof topic !== "string" || !topic.startsWith(`${discoveryPrefix}/`)) return null;
+  const rest = topic.slice(discoveryPrefix.length + 1).split("/");
+  if (rest.length !== 4 || rest[3] !== "config") return null;
+  const node = rest[1];
+  return node === DASHBOARD_HA_ID || node.startsWith("sparkdash_") ? node : null;
+}
+
+/**
+ * Whether a retained discovery config was written by this dashboard: its
+ * availability (or, for the dashboard's own sensor, its state) is our status
+ * topic. Another sparkDash on the same broker, under a different topic prefix,
+ * owns its configs and keeps them.
+ */
+export function isOwnDiscoveryPayload(payload, prefix) {
+  let config;
+  try {
+    config = JSON.parse(payload);
+  } catch {
+    return false;
+  }
+  if (!config || typeof config !== "object") return false;
+  const status = dashboardStatusTopic(prefix);
+  if (config.state_topic === status) return true;
+  return Array.isArray(config.availability) && config.availability.some((a) => a?.topic === status);
+}
+
+/** The same discovery topic under another discovery prefix (object ids contain no "/"). */
+export function rebaseDiscoveryTopic(topic, discoveryPrefix) {
+  return `${discoveryPrefix}/${topic.split("/").slice(-4).join("/")}`;
+}
+
+export { DEFAULT_DISCOVERY_PREFIX, nodeId as unitDiscoveryNode };

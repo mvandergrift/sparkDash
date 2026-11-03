@@ -2,7 +2,16 @@ import { randomBytes } from "node:crypto";
 import mqtt from "mqtt";
 import { unitMetricJson } from "../prometheus.js";
 import { dashboardStatusTopic, unitMetricsTopic, unitStatusTopic } from "./topics.js";
-import { DEFAULT_DISCOVERY_PREFIX, dashboardDiscoveryMessages, unitDiscoveryMessages } from "./haDiscovery.js";
+import {
+  DEFAULT_DISCOVERY_PREFIX,
+  dashboardDiscoveryMessages,
+  discoverySweepFilter,
+  isOwnDiscoveryPayload,
+  rebaseDiscoveryTopic,
+  sparkdashDiscoveryNode,
+  unitDiscoveryMessages,
+  unitDiscoveryNode,
+} from "./haDiscovery.js";
 
 const LOG_QUIET_MS = 30_000;
 const DEFAULT_PREFIX = "sparkdash";
@@ -30,6 +39,12 @@ export const MAX_PENDING_REMOVALS = 100;
  * (a unit carries a few dozen). Past this the oldest are forgotten.
  */
 export const MAX_PENDING_DISCOVERY_REMOVALS = 2_000;
+/**
+ * How long after the broker accepts the sweep subscription its retained
+ * discovery configs are collected before stale ones are removed. MQTT has no
+ * "end of retained messages" marker; brokers send them right after the SUBACK.
+ */
+export const DISCOVERY_SWEEP_SETTLE_MS = 5_000;
 
 /**
  * Outbound MQTT bridge (opt-in, Settings → MQTT): republishes what sparkDash
@@ -45,6 +60,13 @@ export const MAX_PENDING_DISCOVERY_REMOVALS = 2_000;
  * and all of them again after a reconnect, so a broker restart self-heals. A
  * removed unit's retained topics, and discovery configs for a unit, GPU, LLM
  * port, interface or disk that went away, are cleared at the broker.
+ *
+ * Discovery cleanup does not rely on memory alone: after every connect a
+ * short-lived subscription collects the retained configs this dashboard owns
+ * under the current discovery prefix, and any the fleet no longer produces
+ * (or all of them, with discovery off) are emptied. That covers configs left
+ * by a restart, by discovery being switched off while MQTT was off, and by
+ * removals that never reached the broker.
  *
  * Publishing never throws and never blocks a poll loop: while the broker is
  * unreachable the client keeps retrying on its own and publishes are skipped
@@ -101,6 +123,12 @@ export class MqttPublisher {
     /** Discovery topics whose empty-payload removal is still owed to the broker (oldest first). */
     /** @type {Set<string>} */
     this._pendingDiscoveryRemovals = new Set();
+    /**
+     * The connect-time sweep in progress, if any: retained configs we own,
+     * collected until `settleAt` (set once the broker accepts the subscription).
+     * @type {{ client: object, filter: string, discoveryPrefix: string, base: string, seen: Map<string, string>, settleAt: number | null } | null}
+     */
+    this._sweep = null;
   }
 
   /**
@@ -129,6 +157,8 @@ export class MqttPublisher {
         connectTimeout: 10_000,
         // Never buffer QoS 0 while offline; _publish skips then anyway.
         queueQoSZero: false,
+        // The only subscription is the discovery sweep, which every connect starts afresh.
+        resubscribe: false,
         username: user || undefined,
         // The password never touches settings.json (it is written world-readable);
         // it comes from the SPARKDASH_MQTT_PASSWORD environment variable.
@@ -156,6 +186,10 @@ export class MqttPublisher {
       this._announce();
       this._clearRemovedUnits();
       this._flushDiscoveryRemovals();
+      this._startDiscoverySweep(client);
+    });
+    client.on("message", (topic, payload, packet) => {
+      if (this._client === client) this._collectSweepMessage(topic, payload, packet);
     });
     client.on("error", (err) => this._quietLog(`broker error: ${err?.message}`));
     // "close" / "reconnect" are expected — MQTT.js retries with reconnectPeriod.
@@ -211,7 +245,69 @@ export class MqttPublisher {
     // With discovery on, the sync flushes queued removals once it knows which
     // topics are wanted again; flushing first would delete and recreate them.
     if (s.mqttDiscovery) this._syncDiscovery(units, base, s.mqttDiscoveryPrefix || DEFAULT_DISCOVERY_PREFIX);
-    else this._flushDiscoveryRemovals();
+    else {
+      // Discovery off: whatever the sweep found at the broker is ours and unwanted.
+      const swept = this._takeSweep();
+      if (swept) for (const topic of swept.keys()) this._removeDiscovery(topic);
+      this._flushDiscoveryRemovals();
+    }
+  }
+
+  /**
+   * Subscribe to every discovery config under the current prefix, to learn
+   * which retained configs this dashboard left at the broker. A broker that
+   * refuses the subscription (an ACL) just means no sweep.
+   */
+  _startDiscoverySweep(client) {
+    const discoveryPrefix = this._getSettings().mqttDiscoveryPrefix || DEFAULT_DISCOVERY_PREFIX;
+    const filter = discoverySweepFilter(discoveryPrefix);
+    const sweep = { client, filter, discoveryPrefix, base: this._base, seen: new Map(), settleAt: null };
+    this._sweep = sweep;
+    try {
+      client.subscribe(filter, { qos: 0 }, (err, granted) => {
+        if (this._sweep !== sweep) return;
+        if (err || (Array.isArray(granted) && granted.some((g) => g?.qos >= 128))) {
+          this._sweep = null;
+          this._quietLog(`discovery sweep subscription to ${filter} refused${err?.message ? `: ${err.message}` : ""}; stale entities will not be found`);
+          return;
+        }
+        sweep.settleAt = this._now() + DISCOVERY_SWEEP_SETTLE_MS;
+      });
+    } catch (err) {
+      this._sweep = null;
+      this._quietLog(`discovery sweep subscribe failed: ${err?.message}`);
+    }
+  }
+
+  /** Keep a retained config the sweep found, when this dashboard wrote it. */
+  _collectSweepMessage(topic, payload, packet) {
+    const sweep = this._sweep;
+    // Only the broker's retained replay: live publishes (our own included) are not leftovers.
+    if (!sweep || packet?.retain !== true) return;
+    if (!sparkdashDiscoveryNode(topic, sweep.discoveryPrefix)) return;
+    const text = payload == null ? "" : String(payload);
+    if (!text || !isOwnDiscoveryPayload(text, sweep.base)) return;
+    if (!sweep.seen.has(topic) && sweep.seen.size >= MAX_PENDING_DISCOVERY_REMOVALS) {
+      return this._quietLog(`more than ${MAX_PENDING_DISCOVERY_REMOVALS} discovery configs found by the sweep; the rest are ignored`);
+    }
+    sweep.seen.set(topic, text);
+  }
+
+  /**
+   * End a settled sweep: drop the subscription and hand back what it found
+   * (topic → retained payload). Null while none is running or it is still collecting.
+   * @returns {Map<string, string> | null}
+   */
+  _takeSweep() {
+    const sweep = this._sweep;
+    if (!sweep || sweep.settleAt == null || this._now() < sweep.settleAt) return null;
+    this._sweep = null;
+    try {
+      sweep.client.unsubscribe(sweep.filter);
+    } catch {
+      /* the next connect starts a fresh sweep anyway */
+    }
+    return sweep.seen;
   }
 
   /**
@@ -233,17 +329,22 @@ export class MqttPublisher {
     // The dashboard device first: unit devices name it as via_device.
     const wanted = [...dashboard];
     const seen = new Set();
+    const swept = this._takeSweep();
     for (const { snap } of units) {
       const id = String(snap.id);
       seen.add(id);
-      const previous = this._discoveryByUnit.get(id) ?? [];
-      // Offline: its snapshot no longer lists its hardware. Keep the entities;
-      // its availability topic already reports the outage.
-      if (snap.online !== true) {
-        wanted.push(...previous);
-        continue;
+      let previous = this._discoveryByUnit.get(id) ?? [];
+      if (snap.online !== true && !previous.length && swept) {
+        // Offline since a restart: adopt the configs it left at the broker.
+        const node = unitDiscoveryNode(id);
+        previous = [...swept].filter(([topic]) => sparkdashDiscoveryNode(topic, discoveryPrefix) === node).map(([topic, payload]) => ({ topic, payload }));
       }
-      const messages = unitDiscoveryMessages(snap, ctx);
+      // Offline: its snapshot no longer lists its hardware. Keep the entities
+      // (under the current prefix); its availability topic reports the outage.
+      const messages =
+        snap.online === true
+          ? unitDiscoveryMessages(snap, ctx)
+          : previous.map((m) => ({ topic: rebaseDiscoveryTopic(m.topic, discoveryPrefix), payload: m.payload }));
       const topics = new Set(messages.map((m) => m.topic));
       for (const m of previous) {
         if (!topics.has(m.topic)) this._removeDiscovery(m.topic);
@@ -255,6 +356,12 @@ export class MqttPublisher {
       if (seen.has(id)) continue;
       for (const m of messages) this._removeDiscovery(m.topic);
       this._discoveryByUnit.delete(id);
+    }
+    if (swept) {
+      // Left at the broker but no longer produced: a restart, a removal that
+      // never landed, or hardware that went away while we were not looking.
+      const wantedTopics = new Set(wanted.map((m) => m.topic));
+      for (const topic of swept.keys()) if (!wantedTopics.has(topic)) this._removeDiscovery(topic);
     }
     // A topic produced again supersedes its queued removal; flush the rest
     // before publishing, so nothing empties a config that was just sent.
@@ -475,6 +582,7 @@ export class MqttPublisher {
     this._user = null;
     this._sentState.clear();
     this._inFlight.clear();
+    this._sweep = null;
     // Before end(): it fails every outstanding clear, which must not re-queue them.
     if (!keepPendingRemovals) this._dropPendingRemovals();
     if (!client) return;
